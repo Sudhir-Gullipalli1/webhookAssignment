@@ -3,6 +3,7 @@ using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using WebhookReceiver;
 using WebhookReceiver.Data;
+using WebhookReceiver.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,31 +28,33 @@ app.MapPost("/webhooks/stripe", async (HttpRequest request, AppDbContext db, ILo
         return Results.BadRequest(new { error = "Invalid signature" });
     }
 
-    WebhookEvent webhookEvent;
+    StripeEventRequest? stripeEvent;
     try
     {
-        using var json = JsonDocument.Parse(body);
-        var root = json.RootElement;
-
-        webhookEvent = new WebhookEvent
-        {
-            EventId = root.GetProperty("id").GetString()!,
-            Type = root.GetProperty("type").GetString()!,
-            Livemode = root.TryGetProperty("livemode", out var livemode) && livemode.GetBoolean(),
-            CreatedAtUtc = root.TryGetProperty("created", out var created)
-                ? DateTimeOffset.FromUnixTimeSeconds(created.GetInt64()).UtcDateTime
-                : null,
-            ReceivedAtUtc = DateTime.UtcNow,
-            Payload = body
-        };
+        stripeEvent = JsonSerializer.Deserialize<StripeEventRequest>(body);
     }
-    catch (Exception)
+    catch (JsonException)
     {
-        return Results.BadRequest(new { error = "Invalid event payload" });
+        return Results.BadRequest(new { error = "Malformed JSON" });
     }
 
-    if (string.IsNullOrEmpty(webhookEvent.EventId) || string.IsNullOrEmpty(webhookEvent.Type))
+    if (stripeEvent is null)
         return Results.BadRequest(new { error = "Invalid event payload" });
+
+    if (!ModelValidator.TryValidate(stripeEvent, out var errors))
+        return Results.ValidationProblem(errors);
+
+    var webhookEvent = new WebhookEvent
+    {
+        EventId = stripeEvent.Id!,
+        Type = stripeEvent.Type!,
+        Livemode = stripeEvent.Livemode ?? false,
+        CreatedAtUtc = stripeEvent.Created is long created
+            ? DateTimeOffset.FromUnixTimeSeconds(created).UtcDateTime
+            : null,
+        ReceivedAtUtc = DateTime.UtcNow,
+        Payload = body
+    };
 
     if (await db.WebhookEvents.AnyAsync(e => e.EventId == webhookEvent.EventId))
     {
